@@ -79,7 +79,7 @@ pub fn loop(address: []const u8, port: u16) !void {
         switch (last_cmd) {
             .help, .invalid => {},
             else => {
-                const amt = try conn.buffered.read(&buf);
+                const amt = try conn.read(&buf);
                 try stdout.print("> {s}\n", .{buf[0..amt]});
 
                 if (last_cmd == .exit) break;
@@ -127,7 +127,7 @@ pub fn loop(address: []const u8, port: u16) !void {
                         .exit => .exit,
                         else => unreachable,
                     };
-                    try conn.buffered.writeAll(mem.asBytes(&std.zig.Client.Message.Header{ .tag = tag, .bytes_len = 0 }));
+                    try conn.writeAll(mem.asBytes(&std.zig.Client.Message.Header{ .tag = tag, .bytes_len = 0 }));
                 },
             }
         }
