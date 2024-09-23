@@ -127,6 +127,7 @@ pub fn loop(address: []const u8, port: u16) !void {
                         else => unreachable,
                     };
                     try conn.writer().writeAll(mem.asBytes(&std.zig.Client.Message.Header{ .tag = tag, .bytes_len = 0 }));
+                    try conn.flush();
                 },
             }
         }
