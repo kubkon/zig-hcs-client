@@ -72,8 +72,7 @@ pub fn loop(address: []const u8, port: u16) !void {
     var client = std.http.Client{ .allocator = gpa };
     defer client.deinit();
 
-    const conn_node = try client.connect(address, port, .plain);
-    var conn = conn_node.data;
+    const conn = try client.connect(address, port, .plain);
 
     while (true) {
         switch (last_cmd) {
@@ -127,7 +126,7 @@ pub fn loop(address: []const u8, port: u16) !void {
                         .exit => .exit,
                         else => unreachable,
                     };
-                    try conn.writeAll(mem.asBytes(&std.zig.Client.Message.Header{ .tag = tag, .bytes_len = 0 }));
+                    try conn.writer().writeAll(mem.asBytes(&std.zig.Client.Message.Header{ .tag = tag, .bytes_len = 0 }));
                 },
             }
         }
