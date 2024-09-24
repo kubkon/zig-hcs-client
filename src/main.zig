@@ -1,5 +1,6 @@
-const std = @import("std");
+const assert = std.debug.assert;
 const mem = std.mem;
+const std = @import("std");
 
 var gpa_allocator = std.heap.GeneralPurposeAllocator(.{}){};
 const gpa = gpa_allocator.allocator();
@@ -67,21 +68,51 @@ pub fn loop(address: []const u8, port: u16) !void {
 
     var last_cmd: ReplCmd = .invalid;
 
-    var buf: [1024 * 20]u8 = undefined;
-
     var client = std.http.Client{ .allocator = gpa };
-    defer client.deinit();
+    // TODO I think this should work however currently the remote (aka the compiler) simply call process.exit
+    // on receiving `exit` message so we do not do any proper cleanup of resources causing this end to panic.
+    // defer client.deinit();
+    defer client.connection_pool.deinit(gpa);
+
+    var fifo = std.fifo.LinearFifo(u8, .Dynamic).init(gpa);
+    defer fifo.deinit();
 
     const conn = try client.connect(address, port, .plain);
 
     while (true) {
         switch (last_cmd) {
             .help, .invalid => {},
-            else => {
-                const amt = try conn.read(&buf);
-                try stdout.print("> {s}\n", .{buf[0..amt]});
-
-                if (last_cmd == .exit) break;
+            .exit => break,
+            else => inner: while (true) {
+                const hdr = try receiveMessage(conn, &fifo);
+                defer fifo.discard(hdr.bytes_len);
+                switch (hdr.tag) {
+                    .zig_version => try stdout.print("> Zig version: {s}\n", .{fifo.readableSlice(0)}),
+                    .error_bundle => {
+                        const ErrorBundleHdr = std.zig.Server.Message.ErrorBundle;
+                        const bundle_hdr_len = @sizeOf(ErrorBundleHdr);
+                        if (fifo.readableLength() < bundle_hdr_len) return error.BrokenPipe;
+                        const payload = fifo.readableSlice(0);
+                        const bundle_hdr = std.mem.bytesAsValue(ErrorBundleHdr, payload[0..bundle_hdr_len]);
+                        var extra_buf: std.ArrayListUnmanaged(u32) = .{};
+                        defer extra_buf.deinit(gpa);
+                        try extra_buf.appendUnalignedSlice(gpa, std.mem.bytesAsSlice(
+                            u32,
+                            payload[bundle_hdr_len..][0 .. bundle_hdr.extra_len * @sizeOf(u32)],
+                        ));
+                        const string_bytes = payload[bundle_hdr_len + bundle_hdr.extra_len * @sizeOf(u32) ..][0..bundle_hdr.string_bytes_len];
+                        const bundle: std.zig.ErrorBundle = .{
+                            .extra = extra_buf.items,
+                            .string_bytes = string_bytes,
+                        };
+                        if (bundle.errorMessageCount() > 0) {
+                            try stderr.writeAll("> ");
+                            bundle.renderToStdErr(std.zig.Color.auto.renderOptions());
+                        }
+                        break :inner;
+                    },
+                    else => try stdout.print("> TODO: parse {s}\n", .{@tagName(hdr.tag)}),
+                }
             },
         }
 
@@ -126,10 +157,55 @@ pub fn loop(address: []const u8, port: u16) !void {
                         .exit => .exit,
                         else => unreachable,
                     };
-                    try conn.writer().writeAll(mem.asBytes(&std.zig.Client.Message.Header{ .tag = tag, .bytes_len = 0 }));
+                    try conn.writer().writeAll(mem.asBytes(&std.zig.Client.Message.Header{
+                        .tag = tag,
+                        .bytes_len = 0,
+                    }));
                     try conn.flush();
                 },
             }
+        }
+    }
+}
+
+pub fn receiveMessage(conn: *std.http.Client.Connection, fifo: *std.fifo.LinearFifo(u8, .Dynamic)) !std.zig.Server.Message.Header {
+    const Header = std.zig.Server.Message.Header;
+    var last_amt_zero = false;
+
+    while (true) {
+        if (fifo.readableLength() != fifo.readableSlice(0).len) {
+            // Account for the wrap around.
+            // TODO is this needed on the user-side or is this a bug in std.fifo.LinearFifo?
+            fifo.realign();
+        }
+        const buf = fifo.readableSlice(0);
+        assert(fifo.readableLength() == buf.len);
+        if (buf.len >= @sizeOf(Header)) {
+            const header: *align(1) const Header = @ptrCast(buf[0..@sizeOf(Header)]);
+            const bytes_len = header.bytes_len;
+            const tag = header.tag;
+
+            if (buf.len - @sizeOf(Header) >= bytes_len) {
+                fifo.discard(@sizeOf(Header));
+                return .{
+                    .tag = tag,
+                    .bytes_len = bytes_len,
+                };
+            } else {
+                const needed = bytes_len - (buf.len - @sizeOf(Header));
+                const write_buffer = try fifo.writableWithSize(needed);
+                const amt = try conn.read(write_buffer);
+                fifo.update(amt);
+                continue;
+            }
+        }
+
+        const write_buffer = try fifo.writableWithSize(256);
+        const amt = try conn.read(write_buffer);
+        fifo.update(amt);
+        if (amt == 0) {
+            if (last_amt_zero) return error.BrokenPipe;
+            last_amt_zero = true;
         }
     }
 }
